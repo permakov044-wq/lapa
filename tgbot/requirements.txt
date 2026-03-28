@@ -1,3 +1,4 @@
 pyTelegramBotAPI
-pandas
+sqlite3
+datetime
 openpyxl
