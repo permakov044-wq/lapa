@@ -1,4 +1,0 @@
-pyTelegramBotAPI
-sqlite3
-datetime
-openpyxl
