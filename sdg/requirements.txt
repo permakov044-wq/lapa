@@ -1,2 +1,3 @@
-python-telegram-bot
-openpyxl
+pip instal python-telegram-bot
+pip instal requests
+pip instal openpyxl
