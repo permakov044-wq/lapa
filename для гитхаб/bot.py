@@ -1,0 +1,705 @@
+import sqlite3
+from datetime import datetime, timedelta
+from openpyxl import Workbook
+
+from telegram import (
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    Update
+)
+
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters
+)
+
+import os
+
+
+# Бот будет брать токен из настроек сервера
+TOKEN = os.getenv("BOT_TOKEN")
+
+
+# ------------------------------------------------
+# БАЗА ДАННЫХ
+# ------------------------------------------------
+
+conn = sqlite3.connect("shifts.db")
+cursor = conn.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS shifts(
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+user_id INTEGER,
+start_time TEXT,
+end_time TEXT,
+work_minutes INTEGER,
+night_minutes INTEGER
+)
+""")
+
+conn.commit()
+
+# ------------------------------------------------
+# МЕНЮ
+# ------------------------------------------------
+
+menu = ReplyKeyboardMarkup(
+[
+[KeyboardButton("🚆 Добавить смену")],
+[KeyboardButton("📋 График"), KeyboardButton("📅 Табель")],
+[KeyboardButton("💰 Зарплата за месяц")],
+[KeyboardButton("📊 Доход по месяцам")],
+[KeyboardButton("📁 Excel табель")],
+[KeyboardButton("✏️ Редактировать смену"), KeyboardButton("❌ Удалить смену")]
+],
+resize_keyboard=True
+)
+
+# ------------------------------------------------
+# ФУНКЦИИ ДАТЫ И ВРЕМЕНИ
+# ------------------------------------------------
+
+def parse_date(date_str):
+
+    now = datetime.now()
+    year = now.year
+
+    day, month = map(int, date_str.split("."))
+
+    return datetime(year, month, day)
+
+
+def parse_time(time_str):
+
+    h, m = map(int, time_str.split(":"))
+    return h, m
+
+
+def make_datetime(date_str, time_str):
+
+    d = parse_date(date_str)
+    h, m = parse_time(time_str)
+
+    return datetime(d.year, d.month, d.day, h, m)
+
+
+def fix_end(start, end):
+
+    if end < start:
+        end += timedelta(days=1)
+
+    return end
+
+
+def calc_work_minutes(start, end):
+
+    diff = end - start
+    return int(diff.total_seconds() / 60)
+
+
+def calc_night_minutes(start, end):
+
+    total = 0
+    cur = start
+
+    while cur < end:
+
+        hour = cur.hour
+
+        if hour >= 22 or hour < 6:
+            total += 1
+
+        cur += timedelta(minutes=1)
+
+    return total
+
+
+# ------------------------------------------------
+# СТАРТ
+# ------------------------------------------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    context.user_data["state"] = None
+
+    await update.message.reply_text(
+        "🚆 Бот учёта смен локомотивных бригад",
+        reply_markup=menu
+    )
+
+
+# ------------------------------------------------
+# ДОБАВЛЕНИЕ СМЕНЫ
+# ------------------------------------------------
+
+async def add_shift(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    context.user_data["state"] = "wait_start"
+
+    await update.message.reply_text(
+        "Введите явку\n\nпример:\n26.03 21:30"
+    )
+
+
+async def process_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    try:
+
+        text = update.message.text
+
+        date_part, time_part = text.split()
+
+        start = make_datetime(date_part, time_part)
+
+        context.user_data["start"] = start
+        context.user_data["state"] = "wait_end"
+
+        await update.message.reply_text(
+            "Введите сдачу\n\nпример:\n06:40"
+        )
+
+    except:
+
+        await update.message.reply_text(
+            "Неверный формат\nпример: 26.03 21:30"
+        )
+
+
+async def process_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    try:
+
+        start = context.user_data["start"]
+
+        h, m = parse_time(update.message.text)
+
+        end = datetime(start.year, start.month, start.day, h, m)
+
+        end = fix_end(start, end)
+
+        work = calc_work_minutes(start, end)
+        night = calc_night_minutes(start, end)
+
+        user = update.message.from_user
+
+        cursor.execute(
+        "INSERT INTO shifts (user_id,start_time,end_time,work_minutes,night_minutes) VALUES (?,?,?,?,?)",
+        (user.id,start.isoformat(),end.isoformat(),work,night)
+        )
+
+        conn.commit()
+
+        context.user_data["state"] = None
+
+        wh = work // 60
+        wm = work % 60
+
+        nh = night // 60
+        nm = night % 60
+
+        await update.message.reply_text(
+        f"✅ Смена добавлена\n\nРабочие: {wh}:{wm:02}\nНочные: {nh}:{nm:02}",
+        reply_markup=menu
+        )
+
+    except:
+
+        await update.message.reply_text("Введите время\nпример: 06:40")
+
+
+# ------------------------------------------------
+# ГРАФИК
+# ------------------------------------------------
+
+async def show_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user = update.message.from_user
+
+    cursor.execute(
+        "SELECT id,start_time,end_time FROM shifts WHERE user_id=? ORDER BY start_time",
+        (user.id,)
+    )
+
+    rows = cursor.fetchall()
+
+    if not rows:
+
+        await update.message.reply_text("Смен нет")
+        return
+
+    text = "📋 График смен\n\n"
+
+    for r in rows:
+
+        start = datetime.fromisoformat(r[1])
+        end = datetime.fromisoformat(r[2])
+
+        text += (
+        f"ID {r[0]} | "
+        f"{start.day:02}.{start.month:02} "
+        f"{start.hour:02}:{start.minute:02}"
+        " — "
+        f"{end.hour:02}:{end.minute:02}\n"
+        )
+
+    await update.message.reply_text(text)
+
+
+# ------------------------------------------------
+# ТАБЕЛЬ
+# ------------------------------------------------
+
+async def tabel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    context.user_data["state"] = "wait_month"
+
+    await update.message.reply_text(
+        "Введите месяц\nпример:\n3"
+    )
+
+
+async def tabel_calc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    try:
+
+        month = int(update.message.text)
+
+        user = update.message.from_user
+
+        cursor.execute(
+        "SELECT start_time,work_minutes,night_minutes FROM shifts WHERE user_id=?",
+        (user.id,)
+        )
+
+        rows = cursor.fetchall()
+
+        total_work = 0
+        total_night = 0
+        count = 0
+
+        for r in rows:
+
+            start = datetime.fromisoformat(r[0])
+
+            if start.month == month:
+
+                total_work += r[1]
+                total_night += r[2]
+                count += 1
+
+        wh = total_work // 60
+        wm = total_work % 60
+
+        nh = total_night // 60
+        nm = total_night % 60
+
+        await update.message.reply_text(
+        f"📅 Табель\n\nСмен: {count}\nРабочие: {wh}:{wm:02}\nНочные: {nh}:{nm:02}",
+        reply_markup=menu
+        )
+
+        context.user_data["state"] = None
+
+    except:
+
+        await update.message.reply_text("Введите месяц 1-12")
+# ------------------------------------------------
+# ЗАРПЛАТА ЗА МЕСЯЦ
+# ------------------------------------------------
+
+async def salary_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    context.user_data["state"] = "salary_month"
+
+    await update.message.reply_text(
+        "Введите месяц\nпример:\n3"
+    )
+
+
+async def salary_get_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    try:
+
+        month = int(update.message.text)
+
+        context.user_data["salary_month_value"] = month
+        context.user_data["state"] = "salary_rate"
+
+        await update.message.reply_text(
+            "Введите ставку часа\nпример:\n450"
+        )
+
+    except:
+
+        await update.message.reply_text("Введите месяц числом")
+
+
+async def salary_calc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    try:
+
+        rate = float(update.message.text)
+        month = context.user_data["salary_month_value"]
+
+        user = update.message.from_user
+
+        cursor.execute(
+            "SELECT start_time,work_minutes FROM shifts WHERE user_id=?",
+            (user.id,)
+        )
+
+        rows = cursor.fetchall()
+
+        total_minutes = 0
+
+        for r in rows:
+
+            start = datetime.fromisoformat(r[0])
+
+            if start.month == month:
+
+                total_minutes += r[1]
+
+        hours = total_minutes / 60
+        salary = hours * rate
+
+        await update.message.reply_text(
+            f"💰 Зарплата\n\nЧасы: {hours:.2f}\nСтавка: {rate}\n\nИтого: {salary:.2f}",
+            reply_markup=menu
+        )
+
+        context.user_data["state"] = None
+
+    except:
+
+        await update.message.reply_text("Введите число")
+
+
+# ------------------------------------------------
+# ДОХОД ПО МЕСЯЦАМ
+# ------------------------------------------------
+
+async def income_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    context.user_data["state"] = "income_rate"
+
+    await update.message.reply_text(
+        "Введите ставку часа\nпример:\n450"
+    )
+
+
+async def income_calc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    try:
+
+        rate = float(update.message.text)
+
+        user = update.message.from_user
+
+        cursor.execute(
+            "SELECT start_time,work_minutes FROM shifts WHERE user_id=?",
+            (user.id,)
+        )
+
+        rows = cursor.fetchall()
+
+        months = {}
+
+        for r in rows:
+
+            start = datetime.fromisoformat(r[0])
+            month = start.month
+
+            if month not in months:
+
+                months[month] = 0
+
+            months[month] += r[1]
+
+        text = "📊 Доход по месяцам\n\n"
+
+        for m in sorted(months):
+
+            hours = months[m] / 60
+            salary = hours * rate
+
+            text += f"{m:02} — {salary:.2f}\n"
+
+        await update.message.reply_text(
+            text,
+            reply_markup=menu
+        )
+
+        context.user_data["state"] = None
+
+    except:
+
+        await update.message.reply_text("Введите число")
+
+
+# ------------------------------------------------
+# EXCEL ТАБЕЛЬ
+# ------------------------------------------------
+
+async def excel_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user = update.message.from_user
+
+    cursor.execute(
+        "SELECT start_time,end_time,work_minutes,night_minutes FROM shifts WHERE user_id=?",
+        (user.id,)
+    )
+
+    rows = cursor.fetchall()
+
+    wb = Workbook()
+    ws = wb.active
+
+    ws.append(["Дата","Явка","Сдача","Рабочие часы","Ночные часы"])
+
+    for r in rows:
+
+        start = datetime.fromisoformat(r[0])
+        end = datetime.fromisoformat(r[1])
+
+        ws.append([
+            f"{start.day:02}.{start.month:02}",
+            f"{start.hour:02}:{start.minute:02}",
+            f"{end.hour:02}:{end.minute:02}",
+            r[2] / 60,
+            r[3] / 60
+        ])
+
+    file_name = "tabel.xlsx"
+
+    wb.save(file_name)
+
+    with open(file_name,"rb") as f:
+
+        await update.message.reply_document(f)
+
+
+# ------------------------------------------------
+# УДАЛЕНИЕ СМЕНЫ
+# ------------------------------------------------
+
+async def delete_shift_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    context.user_data["state"] = "delete_id"
+
+    await update.message.reply_text(
+        "Введите ID смены для удаления"
+    )
+
+
+async def delete_shift(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    try:
+
+        shift_id = int(update.message.text)
+        user = update.message.from_user
+
+        cursor.execute(
+            "SELECT id FROM shifts WHERE id=? AND user_id=?",
+            (shift_id, user.id)
+        )
+
+        row = cursor.fetchone()
+
+        if not row:
+
+            await update.message.reply_text(
+                "❌ Смена не найдена или не принадлежит вам"
+            )
+            return
+
+        cursor.execute(
+            "DELETE FROM shifts WHERE id=? AND user_id=?",
+            (shift_id, user.id)
+        )
+
+        conn.commit()
+
+        await update.message.reply_text(
+            "✅ Смена удалена",
+            reply_markup=menu
+        )
+
+        context.user_data["state"] = None
+
+    except:
+
+        await update.message.reply_text("Введите ID смены")
+
+
+# ------------------------------------------------
+# РЕДАКТИРОВАНИЕ СМЕНЫ
+# ------------------------------------------------
+
+async def edit_shift_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    context.user_data["state"] = "edit_id"
+
+    await update.message.reply_text(
+        "Введите ID смены для редактирования"
+    )
+
+
+async def edit_shift_get(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    try:
+
+        shift_id = int(update.message.text)
+
+        context.user_data["edit_id"] = shift_id
+        context.user_data["state"] = "edit_new"
+
+        await update.message.reply_text(
+            "Введите новую явку\nпример:\n26.03 21:30"
+        )
+
+    except:
+
+        await update.message.reply_text("Введите ID")
+
+
+async def edit_shift_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    try:
+
+        shift_id = context.user_data["edit_id"]
+
+        text = update.message.text
+
+        d, t = text.split()
+
+        start = make_datetime(d, t)
+
+        context.user_data["edit_start"] = start
+        context.user_data["state"] = "edit_end"
+
+        await update.message.reply_text("Введите новую сдачу")
+
+    except:
+
+        await update.message.reply_text("Формат: 26.03 21:30")
+
+
+async def edit_shift_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    try:
+
+        start = context.user_data["edit_start"]
+        shift_id = context.user_data["edit_id"]
+
+        h, m = parse_time(update.message.text)
+
+        end = datetime(start.year,start.month,start.day,h,m)
+
+        end = fix_end(start,end)
+
+        work = calc_work_minutes(start,end)
+        night = calc_night_minutes(start,end)
+
+        cursor.execute(
+        """UPDATE shifts
+        SET start_time=?,end_time=?,work_minutes=?,night_minutes=?
+        WHERE id=?""",
+        (start.isoformat(),end.isoformat(),work,night,shift_id)
+        )
+
+        conn.commit()
+
+        await update.message.reply_text(
+            "Смена обновлена",
+            reply_markup=menu
+        )
+
+        context.user_data["state"] = None
+
+    except:
+
+        await update.message.reply_text("Введите время")
+
+
+# ------------------------------------------------
+# РОУТЕР
+# ------------------------------------------------
+
+async def router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    state = context.user_data.get("state")
+
+    if state == "wait_start":
+        await process_start(update,context)
+        return
+
+    if state == "wait_end":
+        await process_end(update,context)
+        return
+
+    if state == "wait_month":
+        await tabel_calc(update,context)
+        return
+
+    if state == "salary_month":
+        await salary_get_month(update,context)
+        return
+
+    if state == "salary_rate":
+        await salary_calc(update,context)
+        return
+
+    if state == "income_rate":
+        await income_calc(update,context)
+        return
+
+    if state == "delete_id":
+        await delete_shift(update,context)
+        return
+
+    if state == "edit_id":
+        await edit_shift_get(update,context)
+        return
+
+    if state == "edit_new":
+        await edit_shift_save(update,context)
+        return
+
+    if state == "edit_end":
+        await edit_shift_end(update,context)
+        return
+
+
+# ------------------------------------------------
+# ЗАПУСК БОТА
+# ------------------------------------------------
+
+app = ApplicationBuilder().token(TOKEN).build()
+
+app.add_handler(CommandHandler("start",start))
+
+app.add_handler(MessageHandler(filters.Text("🚆 Добавить смену"),add_shift))
+app.add_handler(MessageHandler(filters.Text("📋 График"),show_schedule))
+app.add_handler(MessageHandler(filters.Text("📅 Табель"),tabel_start))
+
+app.add_handler(MessageHandler(filters.Text("💰 Зарплата за месяц"),salary_start))
+app.add_handler(MessageHandler(filters.Text("📊 Доход по месяцам"),income_start))
+
+app.add_handler(MessageHandler(filters.Text("📁 Excel табель"),excel_export))
+
+app.add_handler(MessageHandler(filters.Text("❌ Удалить смену"),delete_shift_start))
+app.add_handler(MessageHandler(filters.Text("✏️ Редактировать смену"),edit_shift_start))
+
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,router))
+
+if name == "main":
+    print("Бот запущен")
+    app.run_polling()
